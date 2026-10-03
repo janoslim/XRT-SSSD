@@ -39,6 +39,18 @@ static xuid_t uuid_null = NULL_UUID_LE;
 
 static struct key *icap_keys = NULL;
 
+/*
+ * Experiment knob (mango PR-stall study): when non-zero, the ULP data and
+ * kernel clocks are scaled to this frequency (MHz, must be a clock_wiz table
+ * entry, e.g. 10) for the duration of the ICAP write and restored to the
+ * xclbin's clock topology afterwards. Tests whether ULP switching current
+ * during partial reconfiguration triggers the stall (cf. unmerged XRT PR
+ * #2583). 0 keeps stock behaviour. Writable at runtime for A/B arms.
+ */
+static uint pr_clock_mhz;
+module_param(pr_clock_mhz, uint, 0644);
+MODULE_PARM_DESC(pr_clock_mhz, "ULP clock (MHz) during PR bitstream write, 0 = stock");
+
 #define	ICAP_ERR(icap, fmt, arg...)	\
 	xocl_err(&(icap)->icap_pdev->dev, fmt "\n", ##arg)
 #define	ICAP_WARN(icap, fmt, arg...)	\
@@ -645,6 +657,15 @@ static int ulp_clock_update(struct icap *icap, unsigned short *freqs,
 
 	ICAP_INFO(icap, "returns: %d", err);
 	return err;
+}
+
+static void icap_lower_ulp_clocks(struct icap *icap, unsigned int mhz)
+{
+	/* index 0 = data clock, 1 = kernel clock; others untouched */
+	unsigned short freqs[2] = { mhz, mhz };
+	int err = ulp_clock_update(icap, freqs, ARRAY_SIZE(freqs), 0);
+
+	ICAP_INFO(icap, "PR clock experiment: ULP clocks -> %u MHz, err %d", mhz, err);
 }
 
 static int icap_xclbin_validate_clock_req_impl(struct platform_device *pdev,
@@ -2421,9 +2442,23 @@ static int __icap_xclbin_download(struct icap *icap, struct axlf *xclbin, bool s
 	 * xclbin matches with this xclbin or not
 	 */
 	if (xclbin->m_header.m_mode != XCLBIN_FLAT) {
+		unsigned int mhz = READ_ONCE(pr_clock_mhz);
+
+		if (mhz)
+			icap_lower_ulp_clocks(icap, mhz);
 		err = icap_download_bitstream(icap, xclbin);
 		if (err)
 			goto out;
+		/*
+		 * The forced rescale inside icap_download_bitstream() reprograms
+		 * the MMCMs with the last request, i.e. the lowered one; put the
+		 * xclbin's own frequencies back before any kernel can run.
+		 */
+		if (mhz) {
+			err = icap_refresh_clock_freq(icap, xclbin, slot_id);
+			if (err)
+				goto out;
+		}
 	} else {
 		uuid_copy(&islot->icap_bitstream_uuid, &xclbin->m_header.uuid);
 		ICAP_INFO(icap, "xclbin is generated for flat shell, dont need to program the bitstream ");
