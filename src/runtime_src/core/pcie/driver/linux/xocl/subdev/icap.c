@@ -933,6 +933,11 @@ static int wait_for_done(struct icap *icap)
 		udelay(5);
 		w = reg_rd(&icap->icap_regs->ir_sr);
 		ICAP_INFO(icap, "XHWICAP_SR: %x", w);
+		/* all-ones has DONE/EOS bits set but means the card is gone */
+		if (w == 0xffffffff) {
+			xocl_fence_card(XOCL_PL_TO_PCI_DEV(icap->icap_pdev), "ICAP SR all-ones");
+			return -ENODEV;
+		}
 		if (w & 0x5)
 			return 0;
 	}
@@ -955,6 +960,10 @@ static int icap_write(struct icap *icap, const u32 *word_buf, int size)
 
 	for (i = 0; i < 20; i++) {
 		value = reg_rd(&icap->icap_regs->ir_cr);
+		if (value == 0xffffffff) {
+			xocl_fence_card(XOCL_PL_TO_PCI_DEV(icap->icap_pdev), "ICAP CR all-ones");
+			return -ENODEV;
+		}
 		if ((value & 0x1) == 0)
 			return 0;
 		ndelay(50);
@@ -1016,6 +1025,8 @@ static int bitstream_helper(struct icap *icap, const u32 *word_buffer,
 		remain_word -= word_written, word_buffer += word_written) {
 		wr_fifo_vacancy = reg_rd(&icap->icap_regs->ir_wfv);
 		if (wr_fifo_vacancy <= 0) {
+			if (wr_fifo_vacancy == -1)
+				xocl_fence_card(XOCL_PL_TO_PCI_DEV(icap->icap_pdev), "ICAP WFV all-ones");
 			ICAP_ERR(icap, "no vacancy: %d", wr_fifo_vacancy);
 			err = -EIO;
 			break;

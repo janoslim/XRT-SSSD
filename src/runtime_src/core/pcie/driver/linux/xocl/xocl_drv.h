@@ -364,6 +364,27 @@ static inline void xocl_memcpy_toio(void *iomem, void *buf, u32 size)
 #define XOCL_PCI_DEV_TO_XDEV(pcidev) \
 	pci_get_drvdata(pcidev)
 
+/*
+ * Once a card stops completing reads, every MMIO/config read costs one
+ * root-port completion timeout and none of the pollers here (mailbox, health,
+ * ICAP) stops reading; on mango that froze the host into an IERR. Disabling
+ * the link at the root port turns every later access (this driver, nvme,
+ * firmware) into an immediate all-ones completion and lets pciehp remove the
+ * card's subtree. Callers must only use this after an all-ones read.
+ */
+static inline void xocl_fence_card(struct pci_dev *pdev, const char *why)
+{
+	struct pci_dev *rp = pcie_find_root_port(pdev);
+	u16 lnkctl;
+
+	if (!rp || pcie_capability_read_word(rp, PCI_EXP_LNKCTL, &lnkctl) ||
+	    (lnkctl & PCI_EXP_LNKCTL_LD))
+		return;
+	dev_crit(&pdev->dev, "card stopped responding (%s), disabling link at root port %s\n",
+		 why, pci_name(rp));
+	pcie_capability_set_word(rp, PCI_EXP_LNKCTL, PCI_EXP_LNKCTL_LD);
+}
+
 #define XOCL_PCI_FUNC(xdev_hdl)		\
 	PCI_FUNC(XDEV(xdev_hdl)->pdev->devfn)
 

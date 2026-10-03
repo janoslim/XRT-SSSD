@@ -553,6 +553,16 @@ static int health_check_cb(void *data)
 	if (!health_check)
 		return 0;
 
+	/*
+	 * Hot reset and shell programming stop this thread first, so an
+	 * all-ones config read here means the card is gone, not resetting.
+	 * (XCLMGMT_IOCREBOOT does not stop it, but no 2.23 userspace issues it.)
+	 */
+	if (!pci_device_is_present(lro->core.pdev)) {
+		xocl_fence_card(lro->core.pdev, "config read all-ones");
+		return 0;
+	}
+
 	(void) xocl_xmc_sensor_status(lro);
 
 	(void) xocl_clock_status(lro, &latched);
