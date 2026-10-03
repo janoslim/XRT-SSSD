@@ -52,21 +52,25 @@ module_param(pr_clock_mhz, uint, 0644);
 MODULE_PARM_DESC(pr_clock_mhz, "ULP clock (MHz) during PR bitstream write, 0 = stock");
 
 /*
- * Experiment knobs (mango PR-stall study): pace the partial-bitstream stream
- * into the AXI HWICAP without changing its content or order.
- * icap_burst_words caps the words pushed per FIFO flush (CR=1), so the
- * configuration engine gets fewer frames back-to-back; icap_burst_gap_us
- * idles the ICAP after each flush (udelay, keep <= 1000), lowering the
- * average frame-write rate. Both 0 keeps stock timing. The xclbin mailbox
- * request allows at least 50 s per PR (__icap_peer_xclbin_download), so keep
- * the paced PR well below that.
+ * Pace the partial-bitstream stream into the AXI HWICAP without changing its
+ * content or order. icap_burst_words caps the words pushed per FIFO flush
+ * (CR=1), so the configuration engine gets fewer frames back-to-back;
+ * icap_burst_gap_us idles the ICAP after each flush (udelay, clamped to 1000),
+ * lowering the average frame-write rate. Both 0 restores stock timing.
+ *
+ * Paced is the default on this branch. On mango (SYS-220U-TNR / X12DPU-6)
+ * stock timing stalled 6 of 30 PRs and took the host down, while 16 words +
+ * 20 us stalled 0 of 30 (Fisher one-sided p = 0.012). The default gap is
+ * doubled to 40 us for margin (~59 us per 64 B flush, ~18 s for the 19.6 MB
+ * U2 bandwidth.xclbin). The xclbin mailbox request allows at least 50 s per
+ * PR (__icap_peer_xclbin_download), so keep the paced PR well below that.
  */
-static uint icap_burst_words;
+static uint icap_burst_words = 16;
 module_param(icap_burst_words, uint, 0644);
-MODULE_PARM_DESC(icap_burst_words, "max words per HWICAP FIFO flush during PR, 0 = stock");
-static uint icap_burst_gap_us;
+MODULE_PARM_DESC(icap_burst_words, "max words per HWICAP FIFO flush during PR, 0 = stock (default 16)");
+static uint icap_burst_gap_us = 40;
 module_param(icap_burst_gap_us, uint, 0644);
-MODULE_PARM_DESC(icap_burst_gap_us, "idle us after each HWICAP FIFO flush during PR (<=1000), 0 = stock");
+MODULE_PARM_DESC(icap_burst_gap_us, "idle us after each HWICAP FIFO flush during PR (<=1000), 0 = stock (default 40)");
 
 #define	ICAP_ERR(icap, fmt, arg...)	\
 	xocl_err(&(icap)->icap_pdev->dev, fmt "\n", ##arg)
