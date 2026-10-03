@@ -51,6 +51,23 @@ static uint pr_clock_mhz;
 module_param(pr_clock_mhz, uint, 0644);
 MODULE_PARM_DESC(pr_clock_mhz, "ULP clock (MHz) during PR bitstream write, 0 = stock");
 
+/*
+ * Experiment knobs (mango PR-stall study): pace the partial-bitstream stream
+ * into the AXI HWICAP without changing its content or order.
+ * icap_burst_words caps the words pushed per FIFO flush (CR=1), so the
+ * configuration engine gets fewer frames back-to-back; icap_burst_gap_us
+ * idles the ICAP after each flush (udelay, keep <= 1000), lowering the
+ * average frame-write rate. Both 0 keeps stock timing. The xclbin mailbox
+ * request allows at least 50 s per PR (__icap_peer_xclbin_download), so keep
+ * the paced PR well below that.
+ */
+static uint icap_burst_words;
+module_param(icap_burst_words, uint, 0644);
+MODULE_PARM_DESC(icap_burst_words, "max words per HWICAP FIFO flush during PR, 0 = stock");
+static uint icap_burst_gap_us;
+module_param(icap_burst_gap_us, uint, 0644);
+MODULE_PARM_DESC(icap_burst_gap_us, "idle us after each HWICAP FIFO flush during PR (<=1000), 0 = stock");
+
 #define	ICAP_ERR(icap, fmt, arg...)	\
 	xocl_err(&(icap)->icap_pdev->dev, fmt "\n", ##arg)
 #define	ICAP_WARN(icap, fmt, arg...)	\
@@ -1040,6 +1057,8 @@ static int bitstream_helper(struct icap *icap, const u32 *word_buffer,
 	unsigned word_written = 0;
 	int wr_fifo_vacancy = 0;
 	int err = 0;
+	unsigned burst = READ_ONCE(icap_burst_words);
+	unsigned gap = min(READ_ONCE(icap_burst_gap_us), 1000U);
 
 	BUG_ON(!mutex_is_locked(&icap->icap_lock));
 	for (remain_word = word_count; remain_word > 0;
@@ -1054,12 +1073,16 @@ static int bitstream_helper(struct icap *icap, const u32 *word_buffer,
 		}
 		word_written = (wr_fifo_vacancy < remain_word) ?
 			wr_fifo_vacancy : remain_word;
+		if (burst && word_written > burst)
+			word_written = burst;
 		if (icap_write(icap, word_buffer, word_written) != 0) {
 			ICAP_ERR(icap, "write failed remain %d, written %d",
 					remain_word, word_written);
 			err = -EIO;
 			break;
 		}
+		if (gap)
+			udelay(gap);
 	}
 
 	return err;
@@ -1111,9 +1134,17 @@ static long icap_download(struct icap *icap, const char *buffer,
 
 		err = bitstream_helper(icap, (u32 *)buffer,
 			numCharsRead / sizeof(u32));
-		if (err)
+		if (err) {
+			/* exact stall position for mapping onto the frame decode */
+			ICAP_ERR(icap, "PR stream stopped at byte %u (chunk %u) of %u",
+				byte_read, byte_read / DMA_HWICAP_BITFILE_BUFFER_SIZE,
+				bit_header.BitstreamLength);
 			goto free_buffers;
+		}
 		buffer += numCharsRead;
+		/* paced PRs run far longer than 4.6 s; avoid soft-lockup noise */
+		if (icap_burst_words || icap_burst_gap_us)
+			cond_resched();
 	}
 
 	err = wait_for_done(icap);
