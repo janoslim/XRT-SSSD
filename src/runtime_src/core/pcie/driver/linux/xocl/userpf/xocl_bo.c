@@ -762,9 +762,18 @@ int xocl_userptr_bo_ioctl(
 		 */
 		u64 nr = min(page_count - page_pinned,
 			(1024ULL * 1024 * 1024) / (1ULL << PAGE_SHIFT));
+		unsigned int gup_flags = write ? FOLL_WRITE : 0;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 2, 0) && !defined(RHEL_RELEASE_CODE)
+		/*
+		 * The user buffer may be another card's mmapped P2P BO
+		 * (FPGA-to-FPGA P2P); since 6.2 GUP rejects P2PDMA pages
+		 * unless the caller opts in.
+		 */
+		gup_flags |= FOLL_PCI_P2PDMA;
+#endif
 		if (get_user_pages_fast(
 			args->addr + (page_pinned << PAGE_SHIFT),
-			nr, write, xobj->pages + page_pinned) != nr) {
+			nr, gup_flags, xobj->pages + page_pinned) != nr) {
 			ret = -ENOMEM;
 			goto out0;
 		}

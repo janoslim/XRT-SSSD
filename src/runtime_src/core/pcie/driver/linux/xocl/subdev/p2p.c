@@ -56,6 +56,21 @@ MODULE_PARM_DESC(p2p_max_bar_size,
 #include <linux/memremap.h>
 #endif
 
+#if IS_ENABLED(CONFIG_PCI_P2PDMA) && !defined(RHEL_RELEASE_CODE) && \
+	LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+/*
+ * Since 6.1 dma_map_sg() resolves P2PDMA pages through the PCI P2PDMA core
+ * (pci_p2pdma_map_segment() -> container_of(pgmap, struct
+ * pci_p2pdma_pagemap, pgmap)->provider), and since 6.2 GUP refuses such pages
+ * unless the caller passes FOLL_PCI_P2PDMA. A MEMORY_DEVICE_PCI_P2PDMA pgmap
+ * created with devm_memremap_pages() outside the core has no provider, so
+ * every peer mapping (dma-buf import, userptr of a P2P BO, NVMe O_DIRECT)
+ * fails with -EREMOTEIO. Register the BAR chunks with the core instead.
+ */
+#define XOCL_P2P_PCI_P2PDMA_CORE
+#include <linux/pci-p2pdma.h>
+#endif
+
 #define p2p_err(p2p, fmt, arg...)		\
 	xocl_err(&(p2p)->pdev->dev, fmt "\n", ##arg)
 #define p2p_info(p2p, fmt, arg...)		\
@@ -264,6 +279,53 @@ static void p2p_percpu_ref_exit(void *data)
 	wait_for_completion(&chk->xpmc_comp);
 	percpu_ref_exit(ref);
 }
+
+#ifdef XOCL_P2P_PCI_P2PDMA_CORE
+/*
+ * Register one BAR chunk with the PCI P2PDMA core. The core has no API to
+ * remove a resource; it is devm on the PCI device and stays until the device
+ * is unbound. A chunk that is reserved again, or reserved after the p2p
+ * subdev was re-probed, therefore finds its pagemap via get_dev_pagemap().
+ * The core maps P2PDMA ranges into the linear map, so __va() is the chunk VA.
+ * Pages are never allocated from the core's genpool: their refcount must not
+ * drop to 0 (p2pdma_page_free() would free genpool bits that were never set),
+ * which holds because xocl only takes balanced vm_insert_page()/GUP refs on
+ * top of the initial count of 1.
+ */
+static int p2p_mem_chunk_register(struct p2p *p2p, struct p2p_mem_chunk *chk)
+{
+	struct pci_dev *pcidev = XOCL_PL_TO_PCI_DEV(p2p->pdev);
+	struct dev_pagemap *pgmap;
+	int ret;
+
+	pgmap = get_dev_pagemap(PHYS_PFN(chk->xpmc_pa), NULL);
+	if (pgmap) {
+		bool covers = pgmap->type == MEMORY_DEVICE_PCI_P2PDMA &&
+			pgmap->range.start <= chk->xpmc_pa &&
+			pgmap->range.end >= chk->xpmc_pa + chk->xpmc_size - 1;
+
+		put_dev_pagemap(pgmap);
+		if (!covers) {
+			p2p_err(p2p, "P2P chunk 0x%llx is owned by another pagemap",
+				chk->xpmc_pa);
+			return -EBUSY;
+		}
+	} else {
+		ret = pci_p2pdma_add_resource(pcidev, p2p->p2p_bar_idx,
+			chk->xpmc_size, chk->xpmc_pa -
+			pci_resource_start(pcidev, p2p->p2p_bar_idx));
+		if (ret) {
+			p2p_err(p2p, "pci_p2pdma_add_resource 0x%llx failed: %d",
+				chk->xpmc_pa, ret);
+			return ret;
+		}
+	}
+
+	chk->xpmc_va = __va(chk->xpmc_pa);
+	return 0;
+}
+#endif
+
 static void p2p_mem_chunk_release(struct p2p *p2p, struct p2p_mem_chunk *chk)
 {
 //	struct pci_dev *pdev = XOCL_PL_TO_PCI_DEV(p2p->pdev);
@@ -278,6 +340,15 @@ static void p2p_mem_chunk_release(struct p2p *p2p, struct p2p_mem_chunk *chk)
 	 */
 	if (chk->xpmc_ref == 0 && !chk->xpmc_va)
 		return;
+
+#ifdef XOCL_P2P_PCI_P2PDMA_CORE
+	/* the chunk stays registered; see p2p_mem_chunk_register() */
+	if (chk->xpmc_ref > 0)
+		chk->xpmc_ref--;
+	p2p_info(p2p, "released P2P mem chunk [0x%llx, 0x%llx), cur ref: %d",
+		chk->xpmc_pa, chk->xpmc_pa + chk->xpmc_size, chk->xpmc_ref);
+	return;
+#endif
 
 	if (chk->xpmc_ref > 0)
 		chk->xpmc_ref--;
@@ -327,6 +398,13 @@ static int p2p_mem_chunk_reserve(struct p2p *p2p, struct p2p_mem_chunk *chk)
 		chk->xpmc_ref++;
 		goto done;
 	}
+
+#ifdef XOCL_P2P_PCI_P2PDMA_CORE
+	ret = chk->xpmc_va ? 0 : p2p_mem_chunk_register(p2p, chk);
+	if (!ret)
+		chk->xpmc_ref = 1;
+	goto done;
+#endif
 
 	if (chk->xpmc_va) {
 		p2p_info(p2p, "reuse P2P mem chunk [0x%llx, 0x%llx)",
@@ -1000,6 +1078,11 @@ static int p2p_mem_reclaim_locked(struct platform_device *pdev)
 	struct p2p *p2p = platform_get_drvdata(pdev);
 	struct p2p_mem_chunk *chunks;
 	int i;
+
+#ifdef XOCL_P2P_PCI_P2PDMA_CORE
+	/* chunks stay registered with the PCI P2PDMA core; nothing to reclaim */
+	return 0;
+#endif
 
 	mutex_lock(&p2p->p2p_lock);
 	if (!p2p_is_enabled(p2p)) {
