@@ -58,14 +58,16 @@ struct xocl_xdma {
 };
 
 /*
- * Transfers of at least this many bytes drive both XDMA channels of their
- * direction when the second channel is idle. On the U2 shell one C2H engine
- * stops near 2.5 GB/s while two reach the Gen3 x4 link (~3.6 GB/s).
+ * C2H transfers of at least this many bytes drive both C2H channels when the
+ * second one is idle. On the U2 shell one C2H engine stops near 2.5 GB/s while
+ * two reach the Gen3 x4 link (64 MiB: 2.50 -> 3.43 GB/s). H2C is not striped:
+ * one H2C engine already reaches ~3.5 GB/s, and two H2C engines reading a peer
+ * P2P BAR are slower (64 MiB pull: 1.11 -> 1.03 GB/s).
  */
 static unsigned int dma_stripe_min = 1 << 20;
 module_param(dma_stripe_min, uint, 0644);
 MODULE_PARM_DESC(dma_stripe_min,
-	"Bytes from which one DMA call uses both XDMA channels of its direction; 0 disables (default 1 MiB)");
+	"Bytes from which one C2H DMA call uses both C2H channels; 0 disables (default 1 MiB)");
 
 struct xdma_async_context {
 	void (*callback_fn)(unsigned long data, int err);
@@ -223,8 +225,8 @@ static int try_acquire_channel(struct platform_device *pdev, u32 dir)
 }
 
 /*
- * Move @pieces on the caller's @channel; large transfers also borrow the other
- * idle channel of the direction so both engines run (see dma_stripe_min).
+ * Move @pieces on the caller's @channel; large C2H transfers also borrow the
+ * other idle C2H channel so both engines run (see dma_stripe_min).
  */
 static ssize_t xdma_migrate_pieces(struct platform_device *pdev, u32 dir,
 	struct xdma_fp_piece *pieces, u32 npieces, u32 channel)
@@ -237,7 +239,7 @@ static ssize_t xdma_migrate_pieces(struct platform_device *pdev, u32 dir,
 
 	for (i = 0; i < npieces; i++)
 		total += pieces[i].len;
-	if (dma_stripe_min && total >= dma_stripe_min) {
+	if (dir == 0 && dma_stripe_min && total >= dma_stripe_min) {
 		second = try_acquire_channel(pdev, dir);
 		if (second >= 0)
 			chans[nch++] = second;
