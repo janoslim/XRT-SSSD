@@ -146,10 +146,16 @@ static inline uint32_t xocl_bo_set_slot_idx(unsigned user_flags, uint32_t slot_i
 {
 	struct xcl_bo_flags bo_flag = {};
 
-	bo_flag.flags = user_flags & XRT_BO_FLAGS_MEMIDX_MASK;
+	/*
+	 * Replace only the slot byte. Masking with XRT_BO_FLAGS_MEMIDX_MASK
+	 * here dropped the type bits (P2P, DEV_ONLY, ...) from user_flags,
+	 * so DRM_IOCTL_XOCL_INFO_BO reported 0 and xrt::bo::get_flags()
+	 * could not tell a P2P BO from a normal one.
+	 */
+	bo_flag.flags = user_flags;
 	bo_flag.slot = slot_id;
 
-	return bo_flag.flags; 
+	return bo_flag.flags;
 }
 
 static inline unsigned xocl_bo_type(unsigned user_flags)
