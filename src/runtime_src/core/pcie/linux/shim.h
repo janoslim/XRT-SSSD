@@ -61,6 +61,7 @@ public:
   void *xclMapBO(unsigned int boHandle, bool write);
   int xclUnmapBO(unsigned int boHandle, void* addr);
   int xclSyncBO(unsigned int boHandle, xclBOSyncDirection dir, size_t size, size_t offset);
+  int xclSyncBOBatch(const std::vector<drm_xocl_sync_bo>& entries);
   int xclCopyBO(unsigned int dst_boHandle, unsigned int src_boHandle, size_t size,
                 size_t dst_offset, size_t src_offset);
 

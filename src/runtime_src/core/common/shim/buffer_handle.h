@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <map>
 #include <memory>
+#include <vector>
 
 namespace xrt_core {
 class hwctx_handle; // forward declaration
@@ -68,6 +69,22 @@ public:
   // Sync a buffer to or from device
   virtual void
   sync(direction, size_t size, size_t offset) = 0;
+
+  // One range of sync_batch(); bo must come from the same shim
+  struct sync_range
+  {
+    const buffer_handle* bo;
+    direction dir;
+    size_t size;
+    size_t offset;
+  };
+
+  // Sync several ranges of buffers of this buffer's device in one call
+  virtual void
+  sync_batch(const std::vector<sync_range>& /*ranges*/) const
+  {
+    throw xrt_core::error(std::errc::not_supported, __func__);
+  }
 
   // Copy size bytes from src buffer at src offset into this
   // buffer at dst offset

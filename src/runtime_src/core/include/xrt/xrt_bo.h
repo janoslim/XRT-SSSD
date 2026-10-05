@@ -11,6 +11,7 @@
 #ifdef __cplusplus
 # include <memory>
 # include <type_traits>
+# include <vector>
 #endif
 
 /**
@@ -797,6 +798,35 @@ public:
 private:
   std::shared_ptr<bo_impl> handle;
 };
+
+/*!
+ * @struct bo_sync_range
+ *
+ * @brief
+ * One buffer range for xrt::sync_bos()
+ */
+struct bo_sync_range
+{
+  bo buffer;               // device BO (not p2p or host_only)
+  xclBOSyncDirection dir;  // to or from device
+  size_t size;             // bytes to synchronize
+  size_t offset;           // offset within the BO
+};
+
+/**
+ * sync_bos() - Synchronize several buffer ranges with one driver call
+ *
+ * @param ranges
+ *  Ranges of BOs that all belong to the same device
+ *
+ * Same effect as calling bo::sync() on every range, but all ranges of
+ * one direction share one DMA engine run (and one completion interrupt)
+ * instead of paying the per-call fixed cost once per range. Throws on
+ * driver error.
+ */
+XCL_DRIVER_DLLESPEC
+void
+sync_bos(const std::vector<bo_sync_range>& ranges);
 
 } // namespace xrt
 

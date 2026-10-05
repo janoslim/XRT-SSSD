@@ -425,6 +425,17 @@ public:
   void
   copy_with_export(const bo_impl* src, size_t sz, size_t src_offset, size_t dst_offset)
   {
+    // A P2P destination is BAR-visible to the source device, so the copy runs
+    // there: its DMA engine pushes posted writes into this BAR (2.24 GB/s on
+    // SmartSSD U2) instead of this device pulling with non-posted reads
+    // (1.02 GB/s). It also copies the source's device memory, whereas an
+    // exported plain BO only exposes its host shadow pages to a puller.
+    if (get_flags() == bo::flags::p2p) {
+      auto dst_import_bo = xrt::bo(src->device->get_user_handle(), export_buffer());
+      dst_import_bo.get_handle()->copy(src, sz, src_offset, dst_offset);
+      return;
+    }
+
     // export bo from other device and create an import bo to copy from
     auto src_export_handle = src->export_buffer();
     auto src_import_bo = xrt::bo(device->get_user_handle(), src_export_handle);
@@ -1580,6 +1591,30 @@ copy(const bo& src, size_t sz, size_t src_offset, size_t dst_offset)
     [this, &src, sz, src_offset, dst_offset]{
       handle->copy(src.handle.get(), sz, src_offset, dst_offset);
     });
+}
+
+void
+sync_bos(const std::vector<bo_sync_range>& ranges)
+{
+  if (ranges.empty())
+    return;
+
+  const auto& first = ranges.front().buffer.get_handle();
+  std::vector<xrt_core::buffer_handle::sync_range> handles;
+  handles.reserve(ranges.size());
+  for (const auto& r : ranges) {
+    const auto& impl = r.buffer.get_handle();
+    if (!impl->get_handle())
+      throw xrt_core::error(std::errc::not_supported, "sync_bos: buffer has no driver handle");
+    if (impl->get_core_device() != first->get_core_device())
+      throw xrt_core::error(-EINVAL, "sync_bos: buffers belong to different devices");
+    if (r.size + r.offset > impl->get_size())
+      throw xrt_core::error(-EINVAL, "sync_bos: range past buffer size");
+    // sub-buffers share the parent's driver handle at an offset
+    handles.push_back({impl->get_handle(), static_cast<xrt_core::buffer_handle::direction>(r.dir),
+                       r.size, r.offset + impl->get_offset()});
+  }
+  first->get_handle()->sync_batch(handles);
 }
 
 bo::

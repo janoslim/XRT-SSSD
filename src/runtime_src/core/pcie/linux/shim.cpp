@@ -210,6 +210,19 @@ public:
   }
 
   void
+  sync_batch(const std::vector<sync_range>& ranges) const override
+  {
+    std::vector<drm_xocl_sync_bo> entries;
+    entries.reserve(ranges.size());
+    for (const auto& r : ranges)
+      entries.push_back({static_cast<const buffer_object*>(r.bo)->get_handle(), 0, r.size, r.offset,
+                         r.dir == direction::host2device ? DRM_XOCL_SYNC_BO_TO_DEVICE
+                                                         : DRM_XOCL_SYNC_BO_FROM_DEVICE});
+    if (auto ret = m_shim->xclSyncBOBatch(entries))
+      throw xrt_core::system_error(-ret, "sync_batch failed");
+  }
+
+  void
   copy(const buffer_handle* src, size_t size, size_t dst_offset, size_t src_offset) override
   {
     auto bo_src = static_cast<const buffer_object*>(src);
@@ -1085,6 +1098,17 @@ int shim::xclSyncBO(unsigned int boHandle, xclBOSyncDirection dir, size_t size, 
             DRM_XOCL_SYNC_BO_FROM_DEVICE;
     drm_xocl_sync_bo syncInfo = {boHandle, 0, size, offset, drm_dir};
     int ret = mDev->ioctl(mUserHandle, DRM_IOCTL_XOCL_SYNC_BO, &syncInfo);
+    return ret ? -errno : ret;
+}
+
+/*
+ * xclSyncBOBatch() - one DRM_IOCTL_XOCL_SYNC_BO_BATCH for several BO ranges
+ */
+int shim::xclSyncBOBatch(const std::vector<drm_xocl_sync_bo>& entries)
+{
+    drm_xocl_sync_bo_batch batch = {reinterpret_cast<uint64_t>(entries.data()),
+                                    static_cast<uint32_t>(entries.size()), 0};
+    int ret = mDev->ioctl(mUserHandle, DRM_IOCTL_XOCL_SYNC_BO_BATCH, &batch);
     return ret ? -errno : ret;
 }
 
