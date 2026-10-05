@@ -195,6 +195,8 @@ int xocl_userptr_bo_ioctl(struct drm_device *dev, void *data,
 	struct drm_file *filp);
 int xocl_sync_bo_ioctl(struct drm_device *dev, void *data,
 	struct drm_file *filp);
+int xocl_sync_bo_batch_ioctl(struct drm_device *dev, void *data,
+	struct drm_file *filp);
 int xocl_map_bo_ioctl(struct drm_device *dev, void *data,
 	struct drm_file *filp);
 int xocl_info_bo_ioctl(struct drm_device *dev, void *data,

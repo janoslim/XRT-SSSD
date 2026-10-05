@@ -24,6 +24,7 @@
 #include <linux/pagemap.h>
 #include <linux/version.h>
 #include "common.h"
+#include "../lib/libxdma_api.h"
 
 #ifdef _XOCL_BO_DEBUG
 #define	BO_ENTER(fmt, args...)		\
@@ -947,6 +948,110 @@ clear:
 	}
 out:
 	XOCL_DRM_GEM_OBJECT_PUT_UNLOCKED(gem_obj);
+	return ret;
+}
+
+/*
+ * Batched xocl_sync_bo_ioctl(): every entry becomes one DMA piece and each
+ * direction runs as one DMA call, so N small syncs share one engine start and
+ * one completion interrupt instead of paying the per-call fixed cost N times.
+ */
+int xocl_sync_bo_batch_ioctl(struct drm_device *dev, void *data,
+	struct drm_file *filp)
+{
+	const struct drm_xocl_sync_bo_batch *args = data;
+	struct xocl_drm *drm_p = dev->dev_private;
+	struct xocl_dev *xdev = drm_p->xdev;
+	struct drm_xocl_sync_bo *ents = NULL;
+	struct drm_gem_object **objs = NULL;
+	struct xdma_fp_piece *pieces = NULL;
+	u32 i, dir, n[2] = { 0, 0 };
+	u64 want[2] = { 0, 0 };
+	ssize_t ret = 0;
+
+	if (args->flags || !args->count || args->count > XOCL_SYNC_BO_BATCH_MAX)
+		return -EINVAL;
+	ents = kvmalloc_array(args->count, sizeof(*ents), GFP_KERNEL);
+	objs = kvcalloc(args->count, sizeof(*objs), GFP_KERNEL);
+	pieces = kvcalloc(args->count, sizeof(*pieces), GFP_KERNEL);
+	if (!ents || !objs || !pieces) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	if (copy_from_user(ents, u64_to_user_ptr(args->entries),
+			   args->count * sizeof(*ents))) {
+		ret = -EFAULT;
+		goto out;
+	}
+
+	/* H2C pieces fill the array from the front, C2H pieces from the back */
+	for (i = 0; i < args->count; i++) {
+		const struct drm_xocl_sync_bo *e = &ents[i];
+		const struct drm_xocl_bo *xobj;
+		struct xdma_fp_piece *p;
+		u64 paddr;
+
+		dir = (e->dir == DRM_XOCL_SYNC_BO_TO_DEVICE) ? 1 : 0;
+		objs[i] = xocl_gem_object_lookup(dev, filp, e->handle);
+		if (!objs[i]) {
+			DRM_ERROR("Failed to look up GEM BO %d\n", e->handle);
+			ret = -ENOENT;
+			goto out;
+		}
+		xobj = to_xocl_bo(objs[i]);
+		/* CMA/P2P BOs sync by cache maintenance only; DRM_IOCTL_XOCL_SYNC_BO covers them */
+		if (!xocl_bo_sync_able(xobj->flags) || xocl_bo_cma(xobj) ||
+		    xocl_bo_p2p(xobj)) {
+			ret = -EOPNOTSUPP;
+			goto out;
+		}
+		paddr = xocl_bo_physical_addr(xobj);
+		if (paddr == INVALID_BO_PADDR || !e->size ||
+		    e->offset > objs[i]->size || e->size > objs[i]->size - e->offset) {
+			ret = -EINVAL;
+			goto out;
+		}
+		p = dir ? &pieces[n[1]++] : &pieces[args->count - ++n[0]];
+		p->sgt = alloc_onetime_sg_table(xobj->pages, e->offset, e->size);
+		if (IS_ERR(p->sgt)) {
+			ret = PTR_ERR(p->sgt);
+			p->sgt = NULL;
+			goto out;
+		}
+		p->ep_addr = paddr + e->offset;
+		p->len = e->size;
+		want[dir] += e->size;
+	}
+
+	for (dir = 0; dir < 2 && !ret; dir++) {
+		struct xdma_fp_piece *first = dir ? pieces : pieces + args->count - n[0];
+		int channel;
+
+		if (!n[dir])
+			continue;
+		channel = xocl_acquire_channel(xdev, dir);
+		if (channel < 0) {
+			ret = channel;
+			break;
+		}
+		ret = xocl_migrate_pieces(xdev, dir, first, n[dir], channel);
+		xocl_release_channel(xdev, dir, channel);
+		if (ret >= 0)
+			ret = ((u64)ret == want[dir]) ? 0 : -EIO;
+	}
+out:
+	for (i = 0; pieces && i < args->count; i++) {
+		if (pieces[i].sgt) {
+			sg_free_table(pieces[i].sgt);
+			kfree(pieces[i].sgt);
+		}
+	}
+	for (i = 0; objs && i < args->count; i++)
+		if (objs[i])
+			XOCL_DRM_GEM_OBJECT_PUT_UNLOCKED(objs[i]);
+	kvfree(pieces);
+	kvfree(objs);
+	kvfree(ents);
 	return ret;
 }
 

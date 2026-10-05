@@ -187,6 +187,8 @@ enum drm_xocl_ops {
 	DRM_XOCL_COPY_BO,
 	/* Set CU read-only range */
 	DRM_XOCL_SET_CU_READONLY_RANGE,
+	/* Sync several BO ranges with one DMA engine run per direction */
+	DRM_XOCL_SYNC_BO_BATCH,
 
 	/* The following IOCTLs can only be called from linux kernel space
 	 * WARNING: INTERNAL USE ONLY. NOT FOR PUBLIC CONSUMPTION.
@@ -331,6 +333,24 @@ struct drm_xocl_sync_bo_cb {
 	enum drm_xocl_sync_bo_dir dir;
 	uint64_t cb_func;
 	uint64_t cb_data;
+};
+
+/**
+ * struct drm_xocl_sync_bo_batch - Synchronize several device BO ranges with
+ * one DMA engine run per direction
+ * used with DRM_IOCTL_XOCL_SYNC_BO_BATCH ioctl
+ *
+ * @entries:	user pointer to an array of struct drm_xocl_sync_bo; each entry
+ *		has the DRM_IOCTL_XOCL_SYNC_BO meaning, for BOs backed by device
+ *		memory (no CMA/P2P BOs)
+ * @count:	number of entries, 1..XOCL_SYNC_BO_BATCH_MAX
+ * @flags:	must be 0
+ */
+#define XOCL_SYNC_BO_BATCH_MAX	4096
+struct drm_xocl_sync_bo_batch {
+	uint64_t entries;
+	uint32_t count;
+	uint32_t flags;
 };
 
 /**
@@ -821,4 +841,5 @@ struct drm_xocl_alloc_cma_info {
 #define	DRM_IOCTL_XOCL_MAP_KERN_MEM	XOCL_IOC_ARG(MAP_KERN_MEM, map_kern_mem)
 #define	DRM_IOCTL_XOCL_EXECBUF_CB	XOCL_IOC_ARG(EXECBUF_CB, execbuf_cb)
 #define	DRM_IOCTL_XOCL_SYNC_BO_CB	XOCL_IOC_ARG(SYNC_BO_CB, sync_bo_cb)
+#define	DRM_IOCTL_XOCL_SYNC_BO_BATCH	XOCL_IOC_ARG(SYNC_BO_BATCH, sync_bo_batch)
 #endif

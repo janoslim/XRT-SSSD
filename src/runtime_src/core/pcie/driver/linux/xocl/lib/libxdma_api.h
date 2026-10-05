@@ -172,8 +172,29 @@ int xdma_user_isr_disable(void *dev_hndl, unsigned int mask);
 ssize_t xdma_xfer_submit(void *dev_hndl, int channel, bool write, u64 ep_addr,
 			struct sg_table *sgt, bool dma_mapped, int timeout_ms,
 		       	struct xdma_io_cb *cb);
-ssize_t xdma_xfer_fastpath(void *dev_hndl, int channel, bool write, u64 ep_addr,
-			struct sg_table *sgt, bool dma_mapped, int timeout_ms);
+
+/*
+ * struct xdma_fp_piece - one card range fed from a whole sg list
+ * @sgt: sg list owned by this piece alone (xdma maps and unmaps it)
+ * @ep_addr: card (AXI) address of the first byte
+ * @len: bytes to move, at most the sg list length
+ */
+struct xdma_fp_piece {
+	struct sg_table *sgt;
+	u64 ep_addr;
+	u64 len;
+};
+
+/*
+ * xdma_xfer_fastpath - blocking interrupt-driven transfer of @pieces in one
+ *	direction; the byte stream is split into page-aligned shares that run
+ *	concurrently on @channels (one engine per channel)
+ * @done: per-channel bytes moved, array of @nch
+ * return total bytes moved or < 0 in case of error
+ */
+ssize_t xdma_xfer_fastpath(void *dev_hndl, bool write, const u32 *channels, u32 nch,
+			   struct xdma_fp_piece *pieces, u32 npieces, u64 *done,
+			   int timeout_ms);
 			
 /*
  * xdma_device_online - bring device offline

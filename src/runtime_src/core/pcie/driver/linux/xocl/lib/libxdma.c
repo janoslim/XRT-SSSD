@@ -3233,143 +3233,231 @@ static inline void fastpath_desc_clear_last(struct xdma_engine *engine, u32 desc
 	last_desc->control &= cpu_to_le32(~(F_DESC_STOPPED | F_DESC_COMPLETED));
 }
 
-static ssize_t fastpath_start(struct xdma_engine *engine, u64 endpoint_addr,
-			      struct scatterlist **sg, u32 *sg_off, u32 *last_adj)
+/*
+ * Fast path: each engine owns a fixed ring of F_DESC_NUM descriptors (built at
+ * init) that is refilled per engine start. A transfer is a list of pieces; their
+ * concatenated byte stream is cut into page-aligned shares, one per channel, so
+ * one call can drive both engines of a direction. On the SmartSSD U2 shell a
+ * single C2H engine stops near 2.5 GB/s while two reach the Gen3 x4 link.
+ */
+struct fp_stream {
+	struct xdma_engine *engine;
+	struct xdma_fp_piece *p, *p_end;	/* current piece, end of the list */
+	struct scatterlist *sg;			/* current entry of p->sgt */
+	u32 sg_off;				/* bytes of sg already queued */
+	u64 p_left;				/* bytes of p not yet queued */
+	u64 ep;					/* card address of the next byte */
+	u64 left;				/* bytes of this share not yet queued */
+	u64 queued;				/* bytes of the engine run in flight */
+	u32 last_adj;				/* shadow of first_desc_adjacent */
+};
+
+/* Point @st at byte @pos of its current piece. */
+static void fp_enter_piece(struct fp_stream *st, u64 pos)
 {
-	dma_addr_t addr;
-	int i;
-	u32 len, rest, adj, desc_num = 0;
-	ssize_t total = 0;
+	struct scatterlist *sg = st->p->sgt->sgl;
 
-	for (i = 0; i < F_DESC_NUM && *sg; i++) {
-		addr = sg_dma_address(*sg) + *sg_off;
-		rest = sg_dma_len(*sg) - *sg_off;
-		if (XDMA_DESC_BLEN_MAX < rest) {
-			len = XDMA_DESC_BLEN_MAX;
-			*sg_off += XDMA_DESC_BLEN_MAX;
-		} else {
-			len = rest;
-			*sg_off = 0;
-			*sg = sg_next(*sg);
+	st->p_left = st->p->len - pos;
+	st->ep = st->p->ep_addr + pos;
+	while (sg && pos >= sg_dma_len(sg)) {
+		pos -= sg_dma_len(sg);
+		sg = sg_next(sg);
+	}
+	st->sg = sg;
+	st->sg_off = pos;
+}
+
+/* Queue up to F_DESC_NUM descriptors of @st and start its engine; returns bytes queued. */
+static u64 fp_start(struct fp_stream *st)
+{
+	struct xdma_engine *engine = st->engine;
+	u32 n = 0, adj;
+	u64 len, total = 0;
+
+	while (n < F_DESC_NUM && st->left) {
+		if (!st->p_left) {
+			if (st->p + 1 == st->p_end) {
+				st->left = 0;	/* pieces shorter than the share */
+				break;
+			}
+			st->p++;
+			fp_enter_piece(st, 0);
+			continue;
 		}
-
+		if (!st->sg) {
+			st->left = 0;	/* sg list shorter than the piece: short count */
+			break;
+		}
+		len = min3((u64)sg_dma_len(st->sg) - st->sg_off, st->p_left, st->left);
+		len = min_t(u64, len, XDMA_DESC_BLEN_MAX);
 		if (len) {
-			fastpath_desc_set(engine, engine->f_descs + desc_num, addr, endpoint_addr, len);
-			endpoint_addr += len;
+			fastpath_desc_set(engine, engine->f_descs + n++,
+					  sg_dma_address(st->sg) + st->sg_off, st->ep, len);
+			st->sg_off += len;
+			st->ep += len;
+			st->p_left -= len;
+			st->left -= len;
 			total += len;
-			desc_num++;
+		}
+		if (st->sg_off == sg_dma_len(st->sg)) {
+			st->sg = sg_next(st->sg);
+			st->sg_off = 0;
 		}
 	}
 	if (!total)
 		return 0;
-	fastpath_desc_set_last(engine, desc_num);
-	engine->f_submitted_desc_cnt = desc_num;
 
+	fastpath_desc_set_last(engine, n);
+	engine->f_submitted_desc_cnt = n;
 	enable_interrupts(engine);
-	if (desc_num >= F_DESC_ADJACENT)
-		adj = F_DESC_ADJACENT;
-	else
-		adj = desc_num;
-	if (adj != *last_adj) {
+	adj = min_t(u32, n, F_DESC_ADJACENT);
+	if (adj != st->last_adj) {
 		write_register(adj - 1, &engine->sgdma_regs->first_desc_adjacent,
 			       (unsigned long)(&engine->sgdma_regs->first_desc_adjacent) -
 			       (unsigned long)(&engine->sgdma_regs));
 		mmiowb();
-		*last_adj = adj;
+		st->last_adj = adj;
 	}
+	engine->f_fastpath = true;
 	engine_start_mode_config(engine);
-
+	st->queued = total;
 	return total;
 }
 
-ssize_t xdma_xfer_fastpath(void *dev_hndl, int channel, bool write, u64 ep_addr,
-			   struct sg_table *sgt, bool dma_mapped, int timeout_ms)
+/* Wait for the engine run of @st, acknowledge it and stop the engine. */
+static int fp_wait(struct fp_stream *st, bool write, int timeout_ms)
+{
+	struct xdma_engine *engine = st->engine;
+	u32 err = write ? XDMA_STAT_H2C_ERR_MASK : XDMA_STAT_C2H_ERR_MASK;
+	int ret = 0;
+	u32 val;
+
+	if (!wait_for_completion_timeout(&engine->f_req_compl,
+					 msecs_to_jiffies(timeout_ms))) {
+		pr_err("Wait for request timed out");
+		engine_reg_dump(engine);
+		check_nonzero_interrupt_status(engine->xdev);
+		ret = -EIO;
+	}
+	fastpath_desc_clear_last(engine, engine->f_submitted_desc_cnt);
+	/*
+	 * status_rc must be read anyway to acknowledge the run. It also proves
+	 * success: only the last descriptor carries STOPPED|COMPLETED, so either
+	 * bit without an error bit means every descriptor completed. This saves
+	 * the completed_desc_count read, one PCIe round trip per engine run.
+	 */
+	val = read_register(&engine->regs->status_rc);
+	if (!ret && ((val & err) ||
+		     !(val & (XDMA_STAT_DESC_STOPPED | XDMA_STAT_DESC_COMPLETED)))) {
+		pr_err("engine %s, status error 0x%x.\n", engine->name, val);
+		engine_status_dump(engine);
+		engine_reg_dump(engine);
+		ret = -EIO;
+	}
+	write_register(XDMA_CTRL_RUN_STOP, &engine->regs->control_w1c,
+		       (unsigned long)(&engine->regs->control_w1c) -
+		       (unsigned long)(&engine->regs));
+	return ret;
+}
+
+ssize_t xdma_xfer_fastpath(void *dev_hndl, bool write, const u32 *channels, u32 nch,
+			   struct xdma_fp_piece *pieces, u32 npieces, u64 *done,
+			   int timeout_ms)
 {
 	struct xdma_dev *xdev = (struct xdma_dev *)dev_hndl;
-	struct scatterlist *sg = sgt->sgl;
-	struct xdma_engine *engine;
-	u32 val, sg_off = 0, last_adj = ~0;
-	u64 done_bytes = 0;
+	enum dma_data_direction dir = write ? DMA_TO_DEVICE : DMA_FROM_DEVICE;
+	u32 chan_max = write ? xdev->h2c_channel_max : xdev->c2h_channel_max;
+	struct fp_stream st[XDMA_CHANNEL_NUM_MAX] = {};
+	u64 total = 0, share, pos, moved = 0;
+	u32 i, k, mapped;
 	ssize_t ret = 0;
-	int nents;
+	bool busy;
+
+	if (!nch || nch > XDMA_CHANNEL_NUM_MAX || !npieces)
+		return -EINVAL;
+	for (k = 0; k < nch; k++) {
+		if (channels[k] >= chan_max)
+			return -EINVAL;
+		done[k] = 0;
+	}
 
 	if (poll_mode) {
-		return xdma_xfer_submit(dev_hndl, channel, write, ep_addr, sgt, dma_mapped,
-					timeout_ms, NULL);
+		/* polled completion only exists in the request path: one channel, piece by piece */
+		for (i = 0; i < npieces; i++) {
+			ret = xdma_xfer_submit(dev_hndl, channels[0], write, pieces[i].ep_addr,
+					       pieces[i].sgt, false, timeout_ms, NULL);
+			if (ret < 0)
+				return ret;
+			done[0] += ret;
+		}
+		return done[0];
 	}
 
-	if (write == 1)
-		engine = &xdev->engine_h2c[channel];
-	else
-		engine = &xdev->engine_c2h[channel];
+	for (mapped = 0; mapped < npieces; mapped++) {
+		struct sg_table *sgt = pieces[mapped].sgt;
 
-	if (!dma_mapped) {
-		nents = dma_map_sg(&xdev->pdev->dev, sg, sgt->orig_nents,
-				   engine->dir);
-		if (!nents) {
+		sgt->nents = dma_map_sg(&xdev->pdev->dev, sgt->sgl, sgt->orig_nents, dir);
+		if (!sgt->nents) {
 			xocl_pr_info("map sgl failed, sgt 0x%p.\n", sgt);
-			return -EIO;
-		}
-		sgt->nents = nents;
-	}
-
-	if (!sgt->nents) {
-		pr_err("empty sg table");
-		return -EINVAL;
-	}
-
-	write_register(PCI_DMA_H(engine->f_desc_dma_addr), &engine->sgdma_regs->first_desc_hi,
-		       (unsigned long)(&engine->sgdma_regs->first_desc_hi) -
-		       (unsigned long)(&engine->sgdma_regs));
-	write_register(PCI_DMA_L(engine->f_desc_dma_addr), &engine->sgdma_regs->first_desc_lo,
-		       (unsigned long)(&engine->sgdma_regs->first_desc_lo) -
-		       (unsigned long)(&engine->sgdma_regs));
-	sg = sgt->sgl;
-	while (sg && ret >= 0) {
-		engine->f_fastpath = true;
-		ret = fastpath_start(engine, ep_addr + done_bytes,&sg, &sg_off, &last_adj);
-		if (!ret)
-			continue;
-
-		done_bytes += ret;
-		if (!wait_for_completion_timeout(&engine->f_req_compl,
-						 msecs_to_jiffies(10000))) {
-			pr_err("Wait for request timed out");
-			engine_reg_dump(engine);
-			check_nonzero_interrupt_status(engine->xdev);
 			ret = -EIO;
-		} else {
-			val = read_register(&engine->regs->completed_desc_count);
-			if (val != engine->f_submitted_desc_cnt) {
-				pr_err("Invalid completed count %d, expected %d",
-					    val, engine->f_submitted_desc_cnt);
-				ret = -EINVAL;
-			}
+			goto unmap;
 		}
-		fastpath_desc_clear_last(engine, engine->f_submitted_desc_cnt);
-		val = read_register(&engine->regs->status_rc);
-		if (((engine->dir == DMA_FROM_DEVICE) &&
-		    (val & XDMA_STAT_C2H_ERR_MASK)) ||
-		    ((engine->dir == DMA_TO_DEVICE) &&
-		    (val & XDMA_STAT_H2C_ERR_MASK))) {
-			pr_err("engine %s, status error 0x%x.\n", engine->name,
-			        val);
-			engine_status_dump(engine);
-			engine_reg_dump(engine);
-		}
-		write_register(XDMA_CTRL_RUN_STOP, &engine->regs->control_w1c,
-			       (unsigned long)(&engine->regs->control_w1c) -
-			       (unsigned long)(&engine->regs));
+		total += pieces[mapped].len;
 	}
-	if (!dma_mapped) {
-                dma_unmap_sg(&xdev->pdev->dev, sgt->sgl, sgt->orig_nents,
-			     engine->dir);
-        }
 
+	share = round_up(DIV_ROUND_UP(total, nch), PAGE_SIZE);
+	for (k = 0, pos = 0; k < nch; k++, pos += share) {
+		struct fp_stream *s = &st[k];
+		u64 at = min(pos, total);
+
+		s->engine = write ? &xdev->engine_h2c[channels[k]] : &xdev->engine_c2h[channels[k]];
+		s->left = min(share, total - at);
+		s->last_adj = ~0U;
+		s->p = pieces;
+		s->p_end = pieces + npieces;
+		while (s->p + 1 < s->p_end && at >= s->p->len) {
+			at -= s->p->len;
+			s->p++;
+		}
+		fp_enter_piece(s, at);
+		write_register(PCI_DMA_H(s->engine->f_desc_dma_addr),
+			       &s->engine->sgdma_regs->first_desc_hi,
+			       (unsigned long)(&s->engine->sgdma_regs->first_desc_hi) -
+			       (unsigned long)(&s->engine->sgdma_regs));
+		write_register(PCI_DMA_L(s->engine->f_desc_dma_addr),
+			       &s->engine->sgdma_regs->first_desc_lo,
+			       (unsigned long)(&s->engine->sgdma_regs->first_desc_lo) -
+			       (unsigned long)(&s->engine->sgdma_regs));
+	}
+
+	/* every engine started in a round is waited for, even after an error */
+	do {
+		busy = false;
+		for (k = 0; k < nch; k++)
+			if (st[k].left && fp_start(&st[k]))
+				busy = true;
+		for (k = 0; k < nch; k++) {
+			int r;
+
+			if (!st[k].queued)
+				continue;
+			r = fp_wait(&st[k], write, timeout_ms);
+			if (r)
+				ret = r;
+			else
+				done[k] += st[k].queued;
+			st[k].queued = 0;
+		}
+	} while (busy && !ret);
+
+unmap:
+	for (i = 0; i < mapped; i++)
+		dma_unmap_sg(&xdev->pdev->dev, pieces[i].sgt->sgl, pieces[i].sgt->orig_nents, dir);
 	if (ret < 0)
 		return ret;
-
-	return (ssize_t)done_bytes;
+	for (k = 0; k < nch; k++)
+		moved += done[k];
+	return (ssize_t)moved;
 }
 
 ssize_t xdma_xfer_submit(void *dev_hndl, int channel, bool write, u64 ep_addr,

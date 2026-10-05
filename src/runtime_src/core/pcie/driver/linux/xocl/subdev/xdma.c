@@ -57,41 +57,15 @@ struct xocl_xdma {
 	struct mutex		stat_lock;
 };
 
-static ssize_t xdma_migrate_bo(struct platform_device *pdev,
-	struct sg_table *sgt, u32 dir, u64 paddr, u32 channel, u64 len)
-{
-	struct xocl_xdma *xdma;
-	struct page *pg;
-	struct scatterlist *sg = sgt->sgl;
-	int nents = sgt->orig_nents;
-	pid_t pid = current->pid;
-	int i = 0;
-	ssize_t ret;
-	unsigned long long pgaddr;
-
-	xdma = platform_get_drvdata(pdev);
-	xocl_dbg(&pdev->dev, "TID %d, Channel:%d, Offset: 0x%llx, Dir: %d",
-		pid, channel, paddr, dir);
-	ret = xdma_xfer_fastpath(xdma->dma_handle, channel, dir,
-		paddr, sgt, false, 10000);
-	if (ret >= 0) {
-		xdma->channel_usage[dir][channel] += ret;
-		return ret;
-	}
-
-	xocl_err(&pdev->dev, "DMA failed, Dumping SG Page Table, ep addr %llx",
-		paddr);
-	for (i = 0; i < nents; i++, sg = sg_next(sg)) {
-        if (!sg)
-            break;
-		pg = sg_page(sg);
-		if (!pg)
-			continue;
-		pgaddr = page_to_phys(pg);
-		xocl_err(&pdev->dev, "%i, 0x%llx\n", i, pgaddr);
-	}
-	return ret;
-}
+/*
+ * Transfers of at least this many bytes drive both XDMA channels of their
+ * direction when the second channel is idle. On the U2 shell one C2H engine
+ * stops near 2.5 GB/s while two reach the Gen3 x4 link (~3.6 GB/s).
+ */
+static unsigned int dma_stripe_min = 1 << 20;
+module_param(dma_stripe_min, uint, 0644);
+MODULE_PARM_DESC(dma_stripe_min,
+	"Bytes from which one DMA call uses both XDMA channels of its direction; 0 disables (default 1 MiB)");
 
 struct xdma_async_context {
 	void (*callback_fn)(unsigned long data, int err);
@@ -231,6 +205,73 @@ static void release_channel(struct platform_device *pdev, u32 dir, u32 channel)
 	xdma = platform_get_drvdata(pdev);
         set_bit(channel, &xdma->channel_bitmap[dir]);
         up(&xdma->channel_sem[dir]);
+}
+
+/* Like acquire_channel() but never sleeps; -EBUSY when every channel is taken. */
+static int try_acquire_channel(struct platform_device *pdev, u32 dir)
+{
+	struct xocl_xdma *xdma = platform_get_drvdata(pdev);
+	int channel;
+
+	if (down_trylock(&xdma->channel_sem[dir]))
+		return -EBUSY;
+	for (channel = 0; channel < xdma->channel; channel++)
+		if (test_and_clear_bit(channel, &xdma->channel_bitmap[dir]))
+			return channel;
+	up(&xdma->channel_sem[dir]);
+	return -EIO;
+}
+
+/*
+ * Move @pieces on the caller's @channel; large transfers also borrow the other
+ * idle channel of the direction so both engines run (see dma_stripe_min).
+ */
+static ssize_t xdma_migrate_pieces(struct platform_device *pdev, u32 dir,
+	struct xdma_fp_piece *pieces, u32 npieces, u32 channel)
+{
+	struct xocl_xdma *xdma = platform_get_drvdata(pdev);
+	u32 chans[2] = { channel }, nch = 1, i;
+	u64 done[2] = { 0 }, total = 0;
+	int second = -EBUSY;
+	ssize_t ret;
+
+	for (i = 0; i < npieces; i++)
+		total += pieces[i].len;
+	if (dma_stripe_min && total >= dma_stripe_min) {
+		second = try_acquire_channel(pdev, dir);
+		if (second >= 0)
+			chans[nch++] = second;
+	}
+	ret = xdma_xfer_fastpath(xdma->dma_handle, dir, chans, nch, pieces,
+		npieces, done, 10000);
+	for (i = 0; i < nch; i++)
+		xdma->channel_usage[dir][chans[i]] += done[i];
+	if (second >= 0)
+		release_channel(pdev, dir, second);
+	return ret;
+}
+
+static ssize_t xdma_migrate_bo(struct platform_device *pdev,
+	struct sg_table *sgt, u32 dir, u64 paddr, u32 channel, u64 len)
+{
+	struct xdma_fp_piece piece = { .sgt = sgt, .ep_addr = paddr, .len = len };
+	struct scatterlist *sg;
+	ssize_t ret;
+	int i;
+
+	xocl_dbg(&pdev->dev, "TID %d, Channel:%d, Offset: 0x%llx, Dir: %d",
+		current->pid, channel, paddr, dir);
+	ret = xdma_migrate_pieces(pdev, dir, &piece, 1, channel);
+	if (ret >= 0)
+		return ret;
+
+	xocl_err(&pdev->dev, "DMA failed, Dumping SG Page Table, ep addr %llx",
+		paddr);
+	for_each_sg(sgt->sgl, sg, sgt->orig_nents, i)
+		if (sg_page(sg))
+			xocl_err(&pdev->dev, "%i, 0x%llx\n", i,
+				(unsigned long long)page_to_phys(sg_page(sg)));
+	return ret;
 }
 
 static u32 get_channel_count(struct platform_device *pdev)
@@ -402,6 +443,7 @@ failed:
 
 static struct xocl_dma_funcs xdma_ops = {
 	.migrate_bo = xdma_migrate_bo,
+	.migrate_pieces = xdma_migrate_pieces,
 	.async_migrate_bo = xdma_async_migrate_bo,
 	.ac_chan = acquire_channel,
 	.rel_chan = release_channel,
